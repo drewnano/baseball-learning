@@ -171,3 +171,43 @@ def cost_function_contact_quality(params, sequences_df, tolerances):
     
     return cost
 
+def get_tolerances(pitches):
+    # get some information that we can use for the tolerances 
+    tolerances_summary = pitches.select([ 'pitch_sequence', 'delta_plate_x', 'delta_plate_z', 'delta_velocity']).group_by(['pitch_sequence']).agg([
+        pl.col('delta_plate_x').std().alias('std_delta_x'),
+        pl.col('delta_plate_z').std().alias('std_delta_z'),
+        pl.col('delta_velocity').std().alias('std_delta_velocity'),
+        pl.col('delta_plate_x').mean().alias('mean_delta_x'),
+        pl.col('delta_plate_z').mean().alias('mean_delta_z'),
+        pl.col('delta_velocity').mean().alias('mean_delta_velocity'),
+        pl.col('delta_plate_x').min().alias('min_delta_x'),
+        pl.col('delta_plate_z').min().alias('min_delta_z'),
+        pl.col('delta_velocity').min().alias('min_delta_velocity'),
+        pl.col('delta_plate_x').max().alias('max_delta_x'),
+        pl.col('delta_plate_z').max().alias('max_delta_z'),
+        pl.col('delta_velocity').max().alias('max_delta_velocity'),
+        pl.count().alias('count_sequence')])
+    tolerances_summary = tolerances_summary.filter(pl.col('pitch_sequence').is_in(topnsequences['sequence'].to_list()))
+    return tolerances_summary
+
+def run_optimizer(sequences_df, tolerances, n_calls=50):
+    # Define the search space
+    search_space = [
+        Real(-10, 10, name='delta_plate_x'),
+        Real(-10, 10, name='delta_plate_z'),
+        Real(-10, 10, name='delta_velocity'),
+    ]
+    
+    # Objective function wrapper
+    def objective(params):
+        return cost_function_contact_quality(params, sequences_df, tolerances)
+    
+    # Run Bayesian optimization
+    result = gp_minimize(
+        objective,
+        search_space,
+        n_calls=n_calls,
+        random_state=42
+    )
+    
+    return result
