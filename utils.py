@@ -2,14 +2,71 @@ from pybaseball import statcast
 from pybaseball import statcast_pitcher
 from pybaseball import statcast_batter
 from pybaseball import playerid_lookup
+import polars as pl
+import logging
 def get_pitches(lastname,firstname, start_date, end_date):
-    #find playerid lookup of zack wheeler
+    #find playerid lookup of the player you specify
     pitcher= playerid_lookup(lastname,firstname)
     pitcherid = pitcher.loc[0,"key_mlbam"]
     pitcherid = float(pitcherid)
     #pull zack wheeler's pitch data from the 2020 to 2025 seasons
-    wheeler_pitches = statcast_pitcher(start_date, end_date, pitcherid)
-    return wheeler_pitches
+    pitches = statcast_pitcher(start_date, end_date, pitcherid)
+    #convert pitches from pandas dataframe to polars dataframe
+    pitches = pl.from_pandas(pitches)
+    #create new column which is the unique ID of the at bat
+    pitches = pitches.with_columns(
+        pl.concat_str([pl.col("game_pk").cast(pl.Utf8), pl.lit("_"), pl.col("at_bat_number").cast(pl.Utf8)]).alias("ab_id")
+    )
+    #process pitches using polars lazy version
+    sequences = pitches.lazy().sort(['ab_id', 'pitch_number']).with_columns([
+        # Get next pitch info
+        pl.col('pitch_type').shift(1).over('ab_id').alias('first_pitch_type'),
+        pl.col('plate_x').shift(1).over('ab_id').alias('first_plate_x'),
+        pl.col('plate_z').shift(1).over('ab_id').alias('first_plate_z'),
+        pl.col('release_speed').shift(1).over('ab_id').alias('first_release_speed'),
+        pl.col('description').shift(1).over('ab_id').alias('first_description'),
+        pl.col('events').shift(1).over('ab_id').alias('first_events'),
+        pl.col('woba_value').shift(1).over('ab_id').alias('first_woba_value'),
+    ]).filter(
+        pl.col('events').is_not_null()
+    ).with_columns([
+        (pl.col('plate_x') - pl.col('first_plate_x')).alias('delta_plate_x'),
+        (pl.col('plate_z') - pl.col('first_plate_z')).alias('delta_plate_z'),
+        (pl.col('release_speed') - pl.col('first_release_speed')).alias('delta_velocity'),
+    ])
+
+    # Collect to see results
+    sequences_df = sequences.collect()
+
+    logger.info(f"Total pitch sequences: {len(sequences_df)}")
+    return pitches
+
+def return_top_sequences(pitches, top_n=5):
+    pitch_sequences = pitches.with_columns(
+    next_pitch_type=pl.col("pitch_type").shift(-1).over("ab_id", order_by="pitch_number")
+)
+
+    # Filter out the last pitch of each at-bat (where next_pitch_type is null)
+    pitch_sequences = pitch_sequences.filter(pl.col('next_pitch_type').is_not_null())
+
+    # Create a sequence label
+    pitch_sequences = pitch_sequences.with_columns(
+        sequence = pl.concat_str([
+            pl.col('pitch_type'),
+            pl.lit('-'),
+            pl.col('next_pitch_type')
+        ])
+    )
+
+    # Count each two-pitch sequence
+    sequence_counts = pitch_sequences.group_by('sequence').agg(
+        pl.count().alias('count')
+    ).sort('count', descending=True)
+
+    topnsequences = sequence_counts.head(top_n)
+    return topnsequences
+
+
 
 def get_matching_sequences(params, sequences_df, tolerances):
     """
