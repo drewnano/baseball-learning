@@ -1,15 +1,29 @@
+"""
+utility functions for optimizing pitch tunneling.
+"""
+#1. standard library imports
+import os
+import logging
+import warnings
+#2. third-party imports
 from pybaseball import statcast
 from pybaseball import statcast_pitcher
 from pybaseball import statcast_batter
 from pybaseball import playerid_lookup
+from skopt import gp_minimize
+from skopt.space import Real, Integer, Categorical
+from skopt.plots import plot_convergence
 import polars as pl
 import logging
+
+# utility functions for pitch tunneling analysis:
 def get_pitches(lastname,firstname, start_date, end_date):
     #find playerid lookup of the player you specify
     pitcher= playerid_lookup(lastname,firstname)
     pitcherid = pitcher.loc[0,"key_mlbam"]
     pitcherid = float(pitcherid)
     #pull zack wheeler's pitch data from the 2020 to 2025 seasons
+    #date is in format 'yyyy-mm-dd'
     pitches = statcast_pitcher(start_date, end_date, pitcherid)
     #convert pitches from pandas dataframe to polars dataframe
     pitches = pl.from_pandas(pitches)
@@ -192,10 +206,11 @@ def get_tolerances(pitches):
 
 def run_optimizer(sequences_df, tolerances, n_calls=50):
     # Define the search space
+    # using max and min from the tolerances dataframe
     search_space = [
-        Real(-10, 10, name='delta_plate_x'),
-        Real(-10, 10, name='delta_plate_z'),
-        Real(-10, 10, name='delta_velocity'),
+        Real(tolerances['min_delta_x'], tolerances['max_delta_x'], name='delta_plate_x'),
+        Real(tolerances['min_delta_z'], tolerances['max_delta_z'], name='delta_plate_z'),
+        Real(tolerances['min_delta_velocity'], tolerances['max_delta_velocity'], name='delta_velocity'),
     ]
     
     # Objective function wrapper
