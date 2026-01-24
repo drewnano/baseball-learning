@@ -73,10 +73,15 @@ sequences_df = st.session_state['sequences_df']
 # Main content area
 st.sidebar.header("Game Situation")
 
-# Count selection (after pitch 1)
-balls = st.sidebar.selectbox("Balls (after pitch 1)", options=[0, 1, 2, 3], index=0)
+# Count selection (after pitch 1) - default to 1-0 since 0-0 rarely has a previous pitch
+balls = st.sidebar.selectbox("Balls (after pitch 1)", options=[0, 1, 2, 3], index=1)
 strikes = st.sidebar.selectbox("Strikes (after pitch 1)", options=[0, 1, 2], index=0)
 count_label = f"{balls}-{strikes}"
+
+# Skip 0-0 count as it rarely has a previous pitch
+if count_label == "0-0":
+    st.warning("0-0 count is not available - there is rarely a previous pitch to analyze at this count.")
+    st.stop()
 
 # Filter to this count
 count_sequences = sequences_df.filter(
@@ -87,10 +92,10 @@ if len(count_sequences) == 0:
     st.warning(f"No data available for count {count_label}")
     st.stop()
 
-# Get available first pitch types for this count
+# Get top 3 pitch sequences for this count (most common)
 available_sequences = count_sequences.group_by('pitch_sequence').agg(
     pl.count().alias('count')
-).sort('count', descending=True)
+).sort('count', descending=True).head(3)
 
 pitch_sequence_options = available_sequences['pitch_sequence'].to_list()
 
@@ -138,6 +143,16 @@ weight_contact = st.sidebar.slider(
     step=0.1,
     help="Positive = penalty. Higher = prioritize weak contact more"
 )
+
+# Display cost function equation
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Cost Function:**")
+st.sidebar.latex(r"\text{Cost} = w_g \cdot R_{\text{good}} + w_b \cdot R_{\text{bad}} + w_c \cdot R_{\text{contact}} \cdot \frac{\text{xwOBA}}{0.320}")
+st.sidebar.markdown("**Current Weights:**")
+st.sidebar.markdown(f"- $w_g$ = {weight_good} (strikes/whiffs)")
+st.sidebar.markdown(f"- $w_b$ = {weight_bad} (balls)")
+st.sidebar.markdown(f"- $w_c$ = {weight_contact} (contact quality)")
+st.sidebar.caption("Lower cost = better for pitcher. Negative $w_g$ rewards good outcomes.")
 
 # Main display area - two columns
 col1, col2 = st.columns([2, 1])
@@ -307,6 +322,198 @@ with col2:
             avg_xwoba = contact['next_xwoba'].mean()
             if avg_xwoba:
                 st.markdown(f"- Avg xwOBA on contact: {avg_xwoba:.3f}")
+
+# Pitch Sequence Visualization - First pitch + Top 3 next pitch options
+st.header("Pitch Sequence Options")
+st.markdown(f"**Starting from {pitch1_type} at {count_label} count:** Where should the next pitch go?")
+
+# Get the first pitch's typical location for this count and pitch type
+first_pitch_data = count_sequences.filter(
+    pl.col('pitch_sequence').str.starts_with(f"{pitch1_type}-")
+)
+
+if len(first_pitch_data) >= 10:
+    # Average first pitch location
+    first_pitch_loc = first_pitch_data.select([
+        pl.col('plate_x').mean().alias('avg_x'),
+        pl.col('plate_z').mean().alias('avg_z'),
+    ])
+    first_x = first_pitch_loc['avg_x'][0]
+    first_z = first_pitch_loc['avg_z'][0]
+
+    # Get top 3 next pitch types from this first pitch type
+    next_pitch_options = first_pitch_data.group_by('pitch_sequence').agg([
+        pl.count().alias('n_obs'),
+        pl.col('next_plate_x').mean().alias('next_x'),
+        pl.col('next_plate_z').mean().alias('next_z'),
+    ]).sort('n_obs', descending=True).head(3)
+
+    # Calculate costs for each option
+    pitch_recommendations = []
+    for row in next_pitch_options.iter_rows(named=True):
+        seq = row['pitch_sequence']
+        seq_data = first_pitch_data.filter(pl.col('pitch_sequence') == seq)
+
+        if len(seq_data) >= 10:
+            seq_stats = seq_data.select([
+                pl.col('delta_plate_x').std().alias('std_x'),
+                pl.col('delta_plate_z').std().alias('std_z'),
+                pl.col('delta_velocity').std().alias('std_vel'),
+                pl.col('delta_plate_x').mean().alias('mean_x'),
+                pl.col('delta_plate_z').mean().alias('mean_z'),
+                pl.col('delta_velocity').mean().alias('mean_vel'),
+            ])
+
+            seq_tol = [
+                seq_stats['std_x'][0] * 3,
+                seq_stats['std_z'][0] * 3,
+                seq_stats['std_vel'][0] * 3
+            ]
+
+            cost = cost_function_description_based(
+                [seq_stats['mean_x'][0], seq_stats['mean_z'][0], seq_stats['mean_vel'][0]],
+                seq_data,
+                seq_tol,
+                weight_good=weight_good,
+                weight_bad=weight_bad,
+                weight_contact=weight_contact
+            )
+
+            pitch_recommendations.append({
+                'sequence': seq,
+                'pitch2': seq.split('-')[1],
+                'next_x': row['next_x'],
+                'next_z': row['next_z'],
+                'cost': cost,
+                'n_obs': row['n_obs']
+            })
+
+    # Sort by cost (lower is better)
+    pitch_recommendations = sorted(pitch_recommendations, key=lambda x: x['cost'])
+
+    if pitch_recommendations:
+        # Create the visualization
+        fig2, ax2 = plt.subplots(figsize=(10, 8))
+
+        # Draw strike zone
+        strike_zone = patches.Rectangle(
+            (-17/24, 1.5),
+            34/24,
+            2.0,
+            linewidth=2,
+            edgecolor='black',
+            facecolor='lightgray',
+            alpha=0.3,
+            linestyle='--'
+        )
+        ax2.add_patch(strike_zone)
+
+        # Color map for pitch types
+        pitch_colors = {
+            'FF': '#E41A1C',  # Red - Four-seam fastball
+            'SI': '#377EB8',  # Blue - Sinker
+            'FC': '#4DAF4A',  # Green - Cutter
+            'SL': '#984EA3',  # Purple - Slider
+            'CU': '#FF7F00',  # Orange - Curveball
+            'CH': '#FFFF33',  # Yellow - Changeup
+            'FS': '#A65628',  # Brown - Splitter
+            'KC': '#F781BF',  # Pink - Knuckle curve
+            'ST': '#999999',  # Gray - Sweeper
+        }
+
+        # Plot first pitch location (large circle)
+        ax2.scatter(
+            [first_x], [first_z],
+            c=pitch_colors.get(pitch1_type, 'gray'),
+            s=500,
+            alpha=0.8,
+            edgecolors='black',
+            linewidths=3,
+            label=f'Pitch 1: {pitch1_type}',
+            zorder=5
+        )
+        ax2.annotate(
+            pitch1_type,
+            (first_x, first_z),
+            ha='center', va='center',
+            fontsize=12, fontweight='bold', color='white',
+            zorder=6
+        )
+
+        # Plot top 3 next pitch options with arrows
+        for i, rec in enumerate(pitch_recommendations[:3]):
+            pitch2 = rec['pitch2']
+            color = pitch_colors.get(pitch2, 'gray')
+
+            # Draw arrow from first pitch to next pitch
+            ax2.annotate(
+                '',
+                xy=(rec['next_x'], rec['next_z']),
+                xytext=(first_x, first_z),
+                arrowprops=dict(
+                    arrowstyle='-|>',
+                    color=color,
+                    lw=2,
+                    alpha=0.6
+                ),
+                zorder=3
+            )
+
+            # Plot next pitch location
+            ax2.scatter(
+                [rec['next_x']], [rec['next_z']],
+                c=color,
+                s=350,
+                alpha=0.9,
+                edgecolors='black',
+                linewidths=2,
+                marker='o',
+                zorder=7
+            )
+            ax2.annotate(
+                pitch2,
+                (rec['next_x'], rec['next_z']),
+                ha='center', va='center',
+                fontsize=10, fontweight='bold', color='white',
+                zorder=8
+            )
+
+            # Add cost label near the pitch
+            ax2.annotate(
+                f'#{i+1}: Cost={rec["cost"]:.3f}',
+                (rec['next_x'], rec['next_z'] - 0.25),
+                ha='center', va='top',
+                fontsize=9, color=color,
+                fontweight='bold',
+                zorder=8
+            )
+
+        ax2.set_xlabel('Horizontal Position (ft, catcher view)', fontsize=12)
+        ax2.set_ylabel('Vertical Position (ft)', fontsize=12)
+        ax2.set_title(f'Top 3 Next Pitch Options after {pitch1_type} at {count_label}', fontsize=14)
+        ax2.set_xlim(-2.5, 2.5)
+        ax2.set_ylim(0.5, 4.5)
+        ax2.grid(True, alpha=0.3)
+
+        # Custom legend
+        legend_elements = [
+            patches.Patch(facecolor=pitch_colors.get(pitch1_type, 'gray'), edgecolor='black', label=f'Pitch 1: {pitch1_type}')
+        ]
+        for rec in pitch_recommendations[:3]:
+            legend_elements.append(
+                patches.Patch(facecolor=pitch_colors.get(rec['pitch2'], 'gray'), edgecolor='black',
+                              label=f"{rec['pitch2']}: {rec['n_obs']} obs")
+            )
+        ax2.legend(handles=legend_elements, loc='upper right')
+
+        st.pyplot(fig2)
+
+        # Summary table
+        st.markdown("**Recommendations (sorted by cost):**")
+        for i, rec in enumerate(pitch_recommendations[:3]):
+            st.markdown(f"{i+1}. **{rec['sequence']}** - Cost: {rec['cost']:.3f} ({rec['n_obs']} observations)")
+else:
+    st.warning(f"Not enough data for {pitch1_type} sequences at this count")
 
 # Bottom section - top recommendations
 st.header("Top Pitch Recommendations for this Count")
